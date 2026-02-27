@@ -7,7 +7,7 @@ mod imp {
     use tokio::sync::mpsc;
 
     use crate::nezumi::core::{MediaPacket, MediaTrack, NezumiProducer, TrackKind};
-    use windows::core::{Interface, IUnknown};
+    use windows::core::{GUID, Interface, IUnknown};
     use windows::Win32::Foundation::HMODULE;
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
@@ -17,19 +17,26 @@ mod imp {
         ID3D11DeviceContext,
     };
     use windows::Win32::Media::MediaFoundation::{
-        IMFActivate, IMFAttributes, IMFDXGIDeviceManager, IMFMediaSource, IMFSourceReader,
+        IMFActivate, IMFAttributes, IMFDXGIDeviceManager, IMFMediaSource, IMFMediaType,
+        IMFSourceReader, IMFTransform, MFCreateAttributes, MFCreateDXGIDeviceManager,
+        MFCreateMediaType, MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources,
+        MFSTARTUP_FULL, MFStartup, MFT_MESSAGE_SET_D3D_MANAGER,
         MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
-        MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READER_D3D_MANAGER,
-        MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION, MFCreateAttributes,
-        MFCreateDXGIDeviceManager, MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources,
-        MFSTARTUP_FULL, MFStartup,
+        MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
+        MF_SOURCE_READER_D3D_MANAGER, MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_VERSION,
+        MFMediaType_Video, MFVideoFormat_ARGB32, MFVideoFormat_HEVC, MFVideoFormat_NV12,
     };
     use windows::Win32::System::Com::{
-        CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED,
+        CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED,
     };
 
     const DUMMY_CODEC_ID: u8 = 0;
     const VIDEO_TRACK_ID: u32 = 0;
+    // Windows SDK 10.0.26100.0 exposes this decoder GUID as `CLSID_MSH265DecoderMFT`.
+    // The shim requested a local CMSH-style binding, so we alias the same GUID here.
+    const CLSID_CMSH265DecoderMFT: GUID =
+        GUID::from_u128(0x420a51a3_d605_430c_b4fc_45274fa6c562);
 
     pub struct WindowsMfProducer {
         source_reader: IMFSourceReader,
@@ -39,28 +46,25 @@ mod imp {
         tracks: Vec<MediaTrack>,
     }
 
+    pub struct WindowsMfConsumer {
+        decoder: IMFTransform,
+        _d3d_device: ID3D11Device,
+        _d3d_context: ID3D11DeviceContext,
+        _dxgi_manager: IMFDXGIDeviceManager,
+    }
+
     // SAFETY: `windows` COM interface wrappers in `windows` 0.58 do not implement `Send`/`Sync`
     // automatically. This producer is designed for serialized access through `&mut self` and keeps
     // the COM graph alive for the lifetime of the producer. The Nezumi trait requires `Send + Sync`,
     // so we opt into those bounds explicitly for this scaffold.
     unsafe impl Send for WindowsMfProducer {}
     unsafe impl Sync for WindowsMfProducer {}
+    unsafe impl Send for WindowsMfConsumer {}
+    unsafe impl Sync for WindowsMfConsumer {}
 
     impl WindowsMfProducer {
         pub fn new() -> Result<Self> {
-            // SAFETY: We initialize COM for the current thread using the MTA model before creating
-            // any COM-based Media Foundation objects. This is required for MF and DXGI COM usage.
-            unsafe {
-                CoInitializeEx(None, COINIT_MULTITHREADED)
-                    .ok()
-                    .context("Failed to initialize COM (MTA)")?;
-            }
-
-            // SAFETY: MFStartup must be called once per process before using Media Foundation APIs.
-            // We request the full startup mode because we need capture + source reader functionality.
-            unsafe {
-                MFStartup(MF_VERSION, MFSTARTUP_FULL).context("Failed to startup Media Foundation")?;
-            }
+            initialize_media_foundation()?;
 
             let (d3d_device, d3d_context) = create_d3d11_device()?;
             let dxgi_manager = create_dxgi_device_manager(&d3d_device)?;
@@ -79,6 +83,118 @@ mod imp {
                 }],
             })
         }
+    }
+
+    impl WindowsMfConsumer {
+        pub fn new() -> Result<Self> {
+            initialize_media_foundation()?;
+
+            let (d3d_device, d3d_context) = create_d3d11_device()?;
+            let dxgi_manager = create_dxgi_device_manager(&d3d_device)?;
+            let decoder: IMFTransform = unsafe {
+                CoCreateInstance(
+                    &CLSID_CMSH265DecoderMFT,
+                    None::<&IUnknown>,
+                    CLSCTX_INPROC_SERVER,
+                )
+            }
+            .context("Failed to instantiate HEVC decoder IMFTransform")?;
+
+            let dxgi_unknown: IUnknown = dxgi_manager
+                .cast()
+                .context("Failed to cast DXGI manager for HEVC decoder binding")?;
+
+            // SAFETY: The DXGI device manager is live and backed by the D3D11 device created
+            // above. Passing the COM pointer here tells the decoder to allocate DXGI surfaces for
+            // hardware-accelerated output.
+            unsafe {
+                decoder
+                    .ProcessMessage(
+                        MFT_MESSAGE_SET_D3D_MANAGER,
+                        Interface::as_raw(&dxgi_unknown) as usize,
+                    )
+                    .context("Failed to send MFT_MESSAGE_SET_D3D_MANAGER to HEVC decoder")?;
+            }
+
+            configure_hevc_decoder_media_types(&decoder)?;
+
+            Ok(Self {
+                decoder,
+                _d3d_device: d3d_device,
+                _d3d_context: d3d_context,
+                _dxgi_manager: dxgi_manager,
+            })
+        }
+    }
+
+    fn initialize_media_foundation() -> Result<()> {
+        // SAFETY: We initialize COM for the current thread using the MTA model before creating
+        // any COM-based Media Foundation objects. This is required for MF and DXGI COM usage.
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED)
+                .ok()
+                .context("Failed to initialize COM (MTA)")?;
+        }
+
+        // SAFETY: MFStartup must be called once per process before using Media Foundation APIs.
+        // We request the full startup mode because this shim uses capture + transform components.
+        unsafe {
+            MFStartup(MF_VERSION, MFSTARTUP_FULL).context("Failed to startup Media Foundation")?;
+        }
+
+        Ok(())
+    }
+
+    fn create_video_media_type(subtype: &GUID) -> Result<IMFMediaType> {
+        // SAFETY: MFCreateMediaType allocates a mutable IMFMediaType object owned by the returned
+        // COM wrapper. We immediately configure the required major type and subtype.
+        let media_type = unsafe { MFCreateMediaType() }.context("Failed to create IMFMediaType")?;
+
+        // SAFETY: The media type was just created and is valid for attribute writes.
+        unsafe {
+            media_type
+                .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+                .context("Failed to set MF_MT_MAJOR_TYPE on IMFMediaType")?;
+            media_type
+                .SetGUID(&MF_MT_SUBTYPE, subtype)
+                .context("Failed to set MF_MT_SUBTYPE on IMFMediaType")?;
+        }
+
+        Ok(media_type)
+    }
+
+    fn configure_hevc_decoder_media_types(decoder: &IMFTransform) -> Result<()> {
+        let input_type = create_video_media_type(&MFVideoFormat_HEVC)?;
+
+        // SAFETY: The transform is a live HEVC decoder MFT. Stream 0 is the decoder's default
+        // single input stream and this media type requests compressed HEVC input.
+        unsafe {
+            decoder
+                .SetInputType(0, &input_type, 0)
+                .context("Failed to set HEVC decoder input media type")?;
+        }
+
+        let mut last_error = None;
+        for (subtype, label) in [
+            (MFVideoFormat_NV12, "NV12"),
+            (MFVideoFormat_ARGB32, "ARGB32"),
+        ] {
+            let output_type = create_video_media_type(&subtype)?;
+
+            // SAFETY: Stream 0 is the decoder's default output stream. We prefer NV12 for native
+            // decoder surfaces and fall back to ARGB32 if the decoder does not expose NV12.
+            match unsafe { decoder.SetOutputType(0, &output_type, 0) } {
+                Ok(()) => return Ok(()),
+                Err(err) => last_error = Some(format!("{label}: {err}")),
+            }
+        }
+
+        bail!(
+            "Failed to set HEVC decoder output media type to NV12 or ARGB32{}",
+            last_error
+                .map(|err| format!(" (last error: {err})"))
+                .unwrap_or_default()
+        );
     }
 
     fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
@@ -315,7 +431,14 @@ mod imp {
 
     use crate::nezumi::core::{MediaPacket, MediaTrack, NezumiProducer};
 
+    pub struct WindowsMfConsumer;
     pub struct WindowsMfProducer;
+
+    impl WindowsMfConsumer {
+        pub fn new() -> Result<Self> {
+            bail!("WindowsMfConsumer is only available on Windows");
+        }
+    }
 
     impl WindowsMfProducer {
         pub fn new() -> Result<Self> {
@@ -335,4 +458,4 @@ mod imp {
     }
 }
 
-pub use imp::WindowsMfProducer;
+pub use imp::{WindowsMfConsumer, WindowsMfProducer};
