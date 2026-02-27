@@ -1,0 +1,3 @@
+[workspace]
+members = ["nezumi", "nezumi-driver"]
+resolver = "2"
