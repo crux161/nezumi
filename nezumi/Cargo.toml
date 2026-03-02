@@ -19,3 +19,8 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Direct3D",
     "Win32_System_Variant",
 ] }
+
+[lib]
+name = "nezumi"
+crate-type = ["cdylib", "rlib"]
+source = "src/lib.rs"
